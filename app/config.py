@@ -90,6 +90,7 @@ class Settings(BaseSettings):
     train_max_steps: int = Field(default=10000, alias="TRAIN_MAX_STEPS")
     val_every_n_logs: int = Field(default=0, alias="VAL_EVERY_N_LOGS")
     preview_every_n_steps: int = Field(default=2000, alias="PREVIEW_EVERY_N_STEPS")
+    preview_images_count: int = Field(default=4, alias="PREVIEW_IMAGES_COUNT")
     learning_rate: float = Field(default=1e-4, alias="LEARNING_RATE")
     weight_decay: float = Field(default=1e-2, alias="WEIGHT_DECAY")
     grad_clip_norm: float = Field(default=1.0, alias="GRAD_CLIP_NORM")
