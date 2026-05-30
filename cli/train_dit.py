@@ -730,7 +730,7 @@ def main() -> None:
             if len(sft_files) > preview_limit:
                 _log(f"  ... и ещё {len(sft_files) - preview_limit}")
 
-        use_previous_sides = args.architecture.strip().lower() == "dit_v3"
+        use_previous_sides = args.architecture.strip().lower() in {"dit_v3", "dit_v4"}
         previous_sides_key = settings.previous_sides_key if use_previous_sides else None
         if is_main_process:
             _log(
@@ -783,7 +783,7 @@ def main() -> None:
         )
 
         model_config = build_config_from_settings(settings, architecture_name=args.architecture)
-        use_previous_sides = model_config.architecture_name == "dit_v3"
+        use_previous_sides = model_config.architecture_name in {"dit_v3", "dit_v4"}
         base_model = build_model(model_config).to(device)
         ema = ExponentialMovingAverage(base_model, decay=settings.ema_decay) if settings.use_ema else None
         model: nn.Module

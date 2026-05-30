@@ -3,62 +3,66 @@ Cutter as a Service
 
 ## Scene Dataset CLI
 
-`cli/build_scene_dataset.py` собирает `.sft`-датасет по logical scenes из видео и `advanced markup`.
+`cli/build_scene_dataset_v4.py` собирает `.sft`-датасет по logical scenes из видео.
 
 ### Входные данные
 
 - `--videos-dir`: папка с видео, уже разрезанными по logical scenes (1 файл = 1 сцена)
 - `--width`, `--height`: итоговый размер кадра `W x H` при чтении видео (до разбиения на center/sides)
-- `--center-width`: ширина центральной области `W_C` (симметричный crop по ширине; `(W - W_C)` должно быть чётным)
+- `--center-width`: ширина центральной области `W_C` до деления пополам. Значение должно быть чётным; `(W - W_C)` тоже должно быть чётным.
 
 Сцены нумеруются автоматически по порядку сортировки имён файлов: `scene_logical_id = 0, 1, 2, ...`.
 
 ### Выходной формат `.sft`
 
-Каждая часть датасета (`scene_dataset_part_00001.sft`, ...) содержит тензоры:
+Каждая часть датасета (`scene_dataset_part_00001.sft`, ...) содержит только текущий и предыдущий кадр. Дополнительные карты (`opti_map_*`, `depth_map`, `camera_move_vector`) в v4 не пишутся.
 
-- `source_image_center`: `[N, 16, H, W_C]` — кадр `i`, центральная полоса (симметричный crop)
-- `source_image_sides`: `[N, 16, H, W - W_C]` — боковые области кадра `i` (target для обучения), слева+справа (stack по ширине)
-- `opti_map_1`: `[N, 16, H, W_C]` — optical flow между `i` и `i+2` (flow считается после center-crop)
-- `opti_map_2`: `[N, 16, H/2, W_C/2]` — optical flow между `i` и `i+4`, затем downscale с усреднением
-- `depth_map`: `[N, 16, H/2, W_C/2]` — depth map для кадра `i` (по center-crop)
-- `camera_move_vector`: `[N, 2]` — вектор движения камеры `(dx, dy)`:
-  `median(opti_map_2 * (1 - depth_map))`, знак инвертирован (камера vs движение пикселей)
-- `previous_frame_center`: `[N, 16, H, W_C]` — центр кадра `i-1` (нули для первого кадра сцены)
-- `previous_frame_sides`: `[N, 16, H, W - W_C]` — боковые области кадра `i-1` (нули, если кадра нет)
+Обозначения:
+
+- `W_center_half = W_C / 2`
+- `W_side = (W - W_C) / 2`
+- `N` — число samples после 2x augmentation: каждый выбранный кадр даёт левую половину и зеркальную правую половину.
+
+Raw `.sft` из `build_scene_dataset_v4.py` содержит RGB-тензоры `float32` в диапазоне `[0..1]`:
+
+- `source_image_center`: `[N, 3, H, W_center_half]` — левая половина центра кадра `i` или зеркальная правая половина центра
+- `source_image_sides`: `[N, 3, H, W_side]` — левый бок кадра `i` или зеркальный правый бок; это target для обучения
+- `previous_frame_center`: `[N, 3, H, W_center_half]` — та же половина центра кадра `i-1` (нули для первого кадра сцены)
+- `previous_frame_sides`: `[N, 3, H, W_side]` — тот же бок кадра `i-1` (нули для первого кадра сцены)
 - `scene_logical_id`: `[N]` (`int32`) — id логической сцены в датасете
 - `frame_id`: `[N]` (`int32`) — порядковый номер кадра внутри сцены
 
-Разбиение `source_image_*` и `previous_frame_*` выполняется одинаково: при `left = (W - W_C) // 2` центр —
-`[:, left:left+W_C]`, боковины — `concat([:, :left], [:, left+W_C:])` по ширине.
+Разбиение `source_image_*` и `previous_frame_*` выполняется одинаково. Левая половина сохраняется как есть: `left side + left half(center)`. Правая половина перед сохранением отражается по вертикальной оси: `right side + right half(center)` попадают в те же ключи, что и левые части. Благодаря этому модель учится предсказывать только одну половину кадра в единой ориентации.
+
+После кодирования encoder/decoder API те же ключи используются как latent `.sft`, но с `C = LATENT_CHANNELS` (обычно `16`) и latent-размерами `CONDITION_*`/`QUERY_*`. Например, для side-латента шириной `8` target имеет форму `[N, 16, H_latent, 8]`.
 
 `SFTSceneDataset` (`app/src/utils/sft_reader.py`) при чтении отдаёт поля текущего и предыдущего кадра.
-Старые части с единым ключом `source_frame` по-прежнему поддерживаются: center/sides вычисляются на лету.
 
 ## DiT diffusion training (боковые области)
 
 Проект переходит с детерминированного UNet (`cli/train_unet_sft.py`) на **диффузионный DiT**
 для генерации боковых полос текущего кадра.
 
-### Baseline: ключи scene `.sft`
+### DiT v4: ключи scene `.sft`
 
-Используется тот же `.sft`, что собирает `build_scene_dataset` (остальные поля сохраняются для будущих экспериментов):
+Для `dit_v4` используется encoded latent `.sft` с теми же ключами:
 
-| Роль | Ключ | Форма (пример) |
-|------|------|----------------|
-| condition | `source_image_center` | `[N, 16, H, W_C]` |
-| target (чистый) | `source_image_sides` | `[N, 16, H, W_sides]` |
-| model input на шаге | `noisy_target` | тот же shape, что target — шум добавляется в train loop |
+- condition: `source_image_center`, форма `[N, 16, CONDITION_HEIGHT, CONDITION_WIDTH]`
+- target: `source_image_sides`, форма `[N, 16, QUERY_HEIGHT, QUERY_WIDTH]`
+- previous side condition: `previous_frame_sides`, форма `[N, 16, QUERY_HEIGHT, QUERY_WIDTH]`
+- model input на diffusion-шаге: `noisy_target`, тот же shape, что target; шум добавляется в train loop
+
+`dit_v4` дополнительно маскирует `previous_frame_sides` перед cross-attention: по умолчанию зануляются колонки `1,3,5,7` от правого края side-латента (`DIT_V4_SIDE_MASK_COLUMNS_FROM_RIGHT=1,3,5,7`).
 
 Переопределение ключей: `CONDITION_KEY`, `TARGET_KEY`; размеры DiT: `CONDITION_*`, `QUERY_*`.
 
 ### Обучение
 
 ```bash
-python -m cli.train_dit \
-  --architecture dit_v2 \
+python -m cli.train_dit_v4 \
+  --architecture dit_v4 \
   --dataset-dir D:/data/encoded_scene_dataset \
-  --run-name dit-v2-sides-baseline
+  --run-name dit-v4-half-frame
 ```
 
 Основные параметры diffusion: `PREDICTION_TYPE` (`epsilon`, `v`, `epsilon_v_hybrid`),
@@ -98,29 +102,25 @@ RGB-строки preview декодируются только через вне
 - `DECODER_API_TIMEOUT_SEC=120`
 - `DECODER_API_CHECK_READINESS=true`
 
-### Правила обработки
+### Правила обработки v4
 
-- Если кадра для любого поля не хватает (`i+1`, `i+2`, `i+4`), соответствующее поле заполняется нулями.
-- Разбиение на части (`--part-size-frames`) идет по числу кадров, но сцена не режется посередине:
+- Если предыдущего кадра нет, `previous_frame_center` и `previous_frame_sides` заполняются нулями.
+- Разбиение на части (`--part-size-frames`) идет по числу samples после 2x augmentation, но сцена не режется посередине:
   часть закрывается только после завершения текущей логической сцены.
 - Нормализация/стандартизация вынесены в явные функции:
   - RGB кадры: `float32` в диапазон `[0..1]`
-  - depth: `float32` `[0..1]`
-  - flow: нормализация по размеру карты (`dx/W`, `dy/H`)
-  - camera vector: нормализация по размеру `opti_map_2`
 
 ### Пример запуска
 
 ```bash
-python -m cli.build_scene_dataset \
+python -m cli.build_scene_dataset_v4 \
   --videos-dir D:/data/logical_scenes \
-  --output-dir D:/data/scene_dataset \
+  --output-dir D:/data/scene_dataset_v4 \
   --width 560 \
   --height 240 \
   --center-width 400 \
   --part-size-frames 20000 \
-  --num-workers 8 \
-  --max-in-flight 32
+  --samples-per-video 2
 ```
 
 ## Scene Analytics CLI
