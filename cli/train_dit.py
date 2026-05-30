@@ -688,7 +688,10 @@ def main() -> None:
 
         autocast_enabled = bool(settings.use_autocast and use_cuda)
         autocast_dtype = _resolve_autocast_dtype(settings.autocast_dtype)
-        scaler = torch.cuda.amp.GradScaler(enabled=autocast_enabled and autocast_dtype is torch.float16)
+        scaler = torch.amp.GradScaler(
+            "cuda",
+            enabled=autocast_enabled and autocast_dtype is torch.float16,
+        )
 
         if is_main_process:
             if autocast_enabled:
@@ -792,6 +795,7 @@ def main() -> None:
                 base_model,
                 device_ids=[local_rank],
                 output_device=local_rank,
+                find_unused_parameters=True,
             )
         else:
             model = base_model
