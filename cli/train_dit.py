@@ -85,13 +85,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--preview-every-n-epochs",
         type=int,
-        default=3,
+        default=0,
         help="Период тестового прогона для визуализации (каждые N эпох). 0 отключает.",
+    )
+    parser.add_argument(
+        "--preview-every-n-steps",
+        type=int,
+        default=settings.preview_every_n_steps,
+        help=(
+            "Период тестового прогона для визуализации (каждые N global steps). "
+            "Если > 0, имеет приоритет над preview-every-n-epochs."
+        ),
     )
     parser.add_argument(
         "--preview-images-count",
         type=int,
-        default=4,
+        default=settings.preview_images_count,
         help="Количество фиксированных изображений M для тестового прогона.",
     )
     return parser.parse_args()
@@ -867,30 +876,20 @@ def main() -> None:
         trainable_params = sum(
             parameter.numel() for parameter in base_model.parameters() if parameter.requires_grad
         )
-        max_steps = settings.train_max_steps
+        max_steps = int(settings.train_max_steps)
+        if max_steps <= 0:
+            raise ValueError(
+                "TRAIN_MAX_STEPS должен быть > 0. "
+                "Остановка обучения теперь выполняется по числу global steps."
+            )
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=settings.learning_rate,
             weight_decay=settings.weight_decay,
         )
         cosine_eta_min = settings.learning_rate * 0.1
-        if max_steps > 0:
-            lr_total_steps = max_steps
-            lr_step_mode = "per_step"
-        else:
-            try:
-                steps_per_epoch = len(train_dataloader)
-                if steps_per_epoch <= 0:
-                    raise ValueError("len(train_dataloader) должен быть > 0 для cosine decay.")
-                lr_total_steps = settings.train_num_epochs * steps_per_epoch
-                lr_step_mode = "per_step"
-            except (TypeError, ValueError):
-                lr_total_steps = settings.train_num_epochs
-                lr_step_mode = "per_epoch"
-                if is_main_process:
-                    _log(
-                        "[lr] DataLoader не поддерживает len(), cosine decay применяется по эпохам.",
-                    )
+        lr_total_steps = max_steps
+        lr_step_mode = "per_step"
         lr_scheduler = CosineAnnealingLR(
             optimizer=optimizer,
             T_max=max(1, lr_total_steps),
@@ -930,6 +929,7 @@ def main() -> None:
         global_step = 0
         loss_config = settings.loss_config
         preview_interval_epochs = max(args.preview_every_n_epochs, 0)
+        preview_interval_steps = max(args.preview_every_n_steps, 0)
         preview_images_count = max(args.preview_images_count, 0)
         preview_steps = [1000]
         model_runtime_params = {
@@ -948,20 +948,20 @@ def main() -> None:
         }
         val_every_n_logs = max(int(settings.val_every_n_logs), 0)
         if is_main_process:
+            if preview_interval_epochs > 0 and preview_interval_steps == 0:
+                _log(
+                    "[preview] preview-every-n-epochs устарел в step-based цикле. "
+                    "Используйте preview-every-n-steps; preview будет отключен."
+                )
             _log(
                 "[val] schedule: "
                 + (
-                    f"evaluate every {val_every_n_logs} logging event(s)"
+                    f"evaluate every {val_every_n_logs} step(s)"
                     if val_every_n_logs > 0
-                    else "evaluate at epoch end"
+                    else "disabled during training (only final validation)"
                 )
             )
-            if max_steps > 0:
-                _log(f"Training progress mode: by global steps ({max_steps} steps = 100%).")
-            else:
-                _log(
-                    f"Training progress mode: by epochs ({settings.train_num_epochs} epochs = 100%)."
-                )
+            _log(f"Training progress mode: by global steps ({max_steps} steps = 100%).")
 
         run_context = (
             mlflow_repo.start_run(run_name=args.run_name, tags={"pipeline": "dit-training"})
@@ -982,6 +982,7 @@ def main() -> None:
                     "lr_scheduler_total_steps": lr_total_steps,
                     "lr_scheduler_eta_min": cosine_eta_min,
                     "preview_every_n_epochs": preview_interval_epochs,
+                    "preview_every_n_steps": preview_interval_steps,
                     "preview_images_count": preview_images_count,
                     "preview_steps": ",".join(str(step) for step in preview_steps),
                     "prediction_type": prediction_type,
@@ -1005,6 +1006,7 @@ def main() -> None:
                         "model_params_total": total_params,
                         "model_params_trainable": trainable_params,
                         "preview_every_n_epochs": preview_interval_epochs,
+                        "preview_every_n_steps": preview_interval_steps,
                         "preview_images_count": preview_images_count,
                         "preview_steps": preview_steps,
                         "prediction_type": prediction_type,
@@ -1026,9 +1028,13 @@ def main() -> None:
                 if is_main_process
                 else None
             )
-            if is_main_process and fixed_preview_batch is None and preview_interval_epochs > 0:
+            if (
+                is_main_process
+                and fixed_preview_batch is None
+                and preview_interval_steps > 0
+            ):
                 _log("[preview] Не удалось собрать фиксированный набор изображений, визуализация отключена.")
-            if fixed_preview_batch is not None and preview_interval_epochs > 0:
+            if fixed_preview_batch is not None and preview_interval_steps > 0:
                 preview_generator = torch.Generator(device="cpu").manual_seed(settings.seed)
                 fixed_preview_noise = torch.randn(
                     fixed_preview_batch["target"].shape,
@@ -1038,13 +1044,14 @@ def main() -> None:
             else:
                 fixed_preview_noise = None
 
-            log_events_seen = 0
             last_val_metrics: dict[str, float] = {}
-
-            for epoch in range(settings.train_num_epochs):
-                for batch in train_dataloader:
-                    if max_steps > 0 and global_step >= max_steps:
-                        break
+            train_iterator = iter(train_dataloader)
+            while global_step < max_steps:
+                try:
+                    batch = next(train_iterator)
+                except StopIteration:
+                    train_iterator = iter(train_dataloader)
+                    continue
 
                     step_start_time = time.perf_counter()
                     model.train()
@@ -1125,7 +1132,6 @@ def main() -> None:
                     global_step += 1
 
                     if global_step % settings.log_every_steps == 0:
-                        log_events_seen += 1
                         with torch.no_grad():
                             train_metrics = compute_noise_metrics(
                                 model_output=model_output,
@@ -1171,8 +1177,8 @@ def main() -> None:
                             ) / (1024**2)
 
                         val_metrics: dict[str, float] = {}
-                        should_run_val_now = val_every_n_logs > 0 and (
-                            log_events_seen % val_every_n_logs == 0
+                        should_run_val_now = (
+                            val_every_n_logs > 0 and global_step % val_every_n_logs == 0
                         )
                         if should_run_val_now and is_main_process:
                             eval_model = ema.model if ema is not None else _unwrap_model(model)
@@ -1209,14 +1215,13 @@ def main() -> None:
 
                         if is_main_process:
                             current_val_metrics = val_metrics or last_val_metrics
-                            if max_steps > 0:
-                                _log(
-                                    f"[train] progress {train_metrics['progress_percent']:.2f}% "
-                                    f"({global_step}/{max_steps} steps), "
-                                    f"train_loss={train_metrics['loss_mse']:.6f}, "
-                                    f"val_loss={current_val_metrics.get('loss_mse', float('nan')):.6f}"
-                                )
-                            elif "loss_mse" in current_val_metrics:
+                            _log(
+                                f"[train] progress {train_metrics['progress_percent']:.2f}% "
+                                f"({global_step}/{max_steps} steps), "
+                                f"train_loss={train_metrics['loss_mse']:.6f}, "
+                                f"val_loss={current_val_metrics.get('loss_mse', float('nan')):.6f}"
+                            )
+                            if "loss_mse" in current_val_metrics and val_every_n_logs > 0:
                                 _log(
                                     f"[train/val] step={global_step} "
                                     f"train_loss={train_metrics['loss_mse']:.6f}, "
@@ -1232,6 +1237,48 @@ def main() -> None:
                             optimizer=optimizer,
                             step=global_step,
                             extra={"architecture_name": model_config.architecture_name},
+                        )
+
+                    if (
+                        mlflow_repo is not None
+                        and preview_interval_steps > 0
+                        and global_step % preview_interval_steps == 0
+                        and fixed_preview_batch is not None
+                        and fixed_preview_noise is not None
+                    ):
+                        preview_snapshots = _run_preview_sampling(
+                            model=ema.model if ema is not None else _unwrap_model(model),
+                            scheduler=scheduler,
+                            condition_latents=fixed_preview_batch["condition"],
+                            initial_noise=fixed_preview_noise,
+                            device=device,
+                            use_cuda=use_cuda,
+                            preview_steps=preview_steps,
+                            prediction_type=prediction_type,
+                            previous_sides_latents=(
+                                fixed_preview_batch["previous_sides"] if use_previous_sides else None
+                            ),
+                        )
+                        _log_preview_figure(
+                            mlflow_repo=mlflow_repo,
+                            epoch_index=0,
+                            global_step=global_step,
+                            clean_targets=fixed_preview_batch["target"],
+                            snapshots=preview_snapshots,
+                            preview_steps=preview_steps,
+                        )
+                        _log_preview_figure_decoded(
+                            mlflow_repo=mlflow_repo,
+                            decoder_client=decoder_client,
+                            epoch_index=0,
+                            global_step=global_step,
+                            clean_targets=fixed_preview_batch["target"],
+                            snapshots=preview_snapshots,
+                            preview_steps=preview_steps,
+                        )
+                        _log(
+                            f"[preview] logged denoising figure for step={global_step}, "
+                            f"images={fixed_preview_batch['target'].shape[0]}"
                         )
 
                     # Раннее освобождение ссылок уменьшает пиковое потребление памяти между шагами.
@@ -1252,87 +1299,35 @@ def main() -> None:
                         temporal_loss,
                     )
 
-                if max_steps == 0 and is_main_process:
-                    epoch_progress = ((epoch + 1) / settings.train_num_epochs) * 100.0
+            if val_every_n_logs == 0 and is_main_process:
+                eval_model = ema.model if ema is not None else _unwrap_model(model)
+                final_val_metrics = evaluate_on_validation(
+                    model=eval_model,
+                    dataloader=val_dataloader,
+                    scheduler=scheduler,
+                    device=device,
+                    use_cuda=use_cuda,
+                    autocast_enabled=autocast_enabled,
+                    autocast_dtype=autocast_dtype,
+                    prediction_type=prediction_type,
+                    epsilon_v_hybrid_lambda=epsilon_v_hybrid_lambda,
+                    min_snr_gamma=settings.min_snr_gamma,
+                    loss_config=loss_config,
+                    global_step=global_step,
+                    use_previous_sides=use_previous_sides,
+                )
+                if mlflow_repo is not None:
+                    mlflow_repo.log_metrics(
+                        metrics={
+                            f"val_{key}": float(value) for key, value in final_val_metrics.items()
+                        },
+                        step=global_step,
+                    )
+                if "loss_mse" in final_val_metrics:
                     _log(
-                        f"[train] progress {epoch_progress:.2f}% "
-                        f"({epoch + 1}/{settings.train_num_epochs} epochs)"
+                        f"[val] final step={global_step} "
+                        f"val_loss={final_val_metrics['loss_mse']:.6f}"
                     )
-                if lr_step_mode == "per_epoch":
-                    lr_scheduler.step()
-                if val_every_n_logs == 0 and is_main_process:
-                    eval_model = ema.model if ema is not None else _unwrap_model(model)
-                    epoch_val_metrics = evaluate_on_validation(
-                        model=eval_model,
-                        dataloader=val_dataloader,
-                        scheduler=scheduler,
-                        device=device,
-                        use_cuda=use_cuda,
-                        autocast_enabled=autocast_enabled,
-                        autocast_dtype=autocast_dtype,
-                        prediction_type=prediction_type,
-                        epsilon_v_hybrid_lambda=epsilon_v_hybrid_lambda,
-                        min_snr_gamma=settings.min_snr_gamma,
-                        loss_config=loss_config,
-                        global_step=global_step,
-                        use_previous_sides=use_previous_sides,
-                    )
-                    last_val_metrics = epoch_val_metrics
-                    if mlflow_repo is not None:
-                        mlflow_repo.log_metrics(
-                            metrics={
-                                f"val_{key}": float(value) for key, value in epoch_val_metrics.items()
-                            },
-                            step=global_step,
-                        )
-                    if "loss_mse" in epoch_val_metrics:
-                        _log(
-                            f"[val] epoch={epoch + 1} step={global_step} "
-                            f"val_loss={epoch_val_metrics['loss_mse']:.6f}"
-                        )
-                if (
-                    mlflow_repo is not None
-                    and preview_interval_epochs > 0
-                    and (epoch + 1) % preview_interval_epochs == 0
-                    and fixed_preview_batch is not None
-                    and fixed_preview_noise is not None
-                ):
-                    preview_snapshots = _run_preview_sampling(
-                        model=ema.model if ema is not None else _unwrap_model(model),
-                        scheduler=scheduler,
-                        condition_latents=fixed_preview_batch["condition"],
-                        initial_noise=fixed_preview_noise,
-                        device=device,
-                        use_cuda=use_cuda,
-                        preview_steps=preview_steps,
-                        prediction_type=prediction_type,
-                        previous_sides_latents=(
-                            fixed_preview_batch["previous_sides"] if use_previous_sides else None
-                        ),
-                    )
-                    _log_preview_figure(
-                        mlflow_repo=mlflow_repo,
-                        epoch_index=epoch,
-                        global_step=global_step,
-                        clean_targets=fixed_preview_batch["target"],
-                        snapshots=preview_snapshots,
-                        preview_steps=preview_steps,
-                    )
-                    _log_preview_figure_decoded(
-                        mlflow_repo=mlflow_repo,
-                        decoder_client=decoder_client,
-                        epoch_index=epoch,
-                        global_step=global_step,
-                        clean_targets=fixed_preview_batch["target"],
-                        snapshots=preview_snapshots,
-                        preview_steps=preview_steps,
-                    )
-                    _log(
-                        f"[preview] logged denoising figure for epoch={epoch + 1}, "
-                        f"images={fixed_preview_batch['target'].shape[0]}"
-                    )
-                if max_steps > 0 and global_step >= max_steps:
-                    break
 
             if mlflow_repo is not None:
                 export_model = ema.model if ema is not None else _unwrap_model(model)

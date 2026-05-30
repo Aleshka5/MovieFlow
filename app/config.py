@@ -87,9 +87,9 @@ class Settings(BaseSettings):
 
     train_batch_size: int = Field(default=8, alias="TRAIN_BATCH_SIZE")
     train_num_workers: int = Field(default=0, alias="TRAIN_NUM_WORKERS")
-    train_num_epochs: int = Field(default=40, alias="TRAIN_NUM_EPOCHS")
-    train_max_steps: int = Field(default=0, alias="TRAIN_MAX_STEPS")
+    train_max_steps: int = Field(default=10000, alias="TRAIN_MAX_STEPS")
     val_every_n_logs: int = Field(default=0, alias="VAL_EVERY_N_LOGS")
+    preview_every_n_steps: int = Field(default=2000, alias="PREVIEW_EVERY_N_STEPS")
     learning_rate: float = Field(default=1e-4, alias="LEARNING_RATE")
     weight_decay: float = Field(default=1e-2, alias="WEIGHT_DECAY")
     grad_clip_norm: float = Field(default=1.0, alias="GRAD_CLIP_NORM")
@@ -163,9 +163,10 @@ class Settings(BaseSettings):
             "autocast_dtype": self.autocast_dtype,
             "train_batch_size": self.train_batch_size,
             "train_num_workers": self.train_num_workers,
-            "train_num_epochs": self.train_num_epochs,
             "train_max_steps": self.train_max_steps,
             "val_every_n_logs": self.val_every_n_logs,
+            "preview_every_n_steps": self.preview_every_n_steps,
+            "preview_images_count": self.preview_images_count,
             "learning_rate": self.learning_rate,
             "weight_decay": self.weight_decay,
             "grad_clip_norm": self.grad_clip_norm,
