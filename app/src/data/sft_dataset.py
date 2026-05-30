@@ -161,6 +161,15 @@ class DiTSFTDataset(IterableDataset[dict[str, Tensor]]):
                 if not isinstance(scene_ids, torch.Tensor):
                     raise TypeError(f"{file_path.name}: scene_logical_id должен быть torch.Tensor")
                 split_indices = self._scene_dataset._resolve_split_indices(scene_ids)
+            frame_ids = payload.get("frame_id")
+            if frame_ids is not None:
+                if not isinstance(frame_ids, torch.Tensor):
+                    raise TypeError(f"{file_path.name}: frame_id должен быть torch.Tensor")
+                if frame_ids.ndim != 1 or frame_ids.shape[0] != condition_all.shape[0]:
+                    raise ValueError(
+                        f"{file_path.name}: frame_id должен быть 1D тензором длины "
+                        f"{condition_all.shape[0]}, получено shape={tuple(frame_ids.shape)}"
+                    )
 
             for sample_index in split_indices:
                 if self.distributed_world_size > 1:
@@ -182,6 +191,8 @@ class DiTSFTDataset(IterableDataset[dict[str, Tensor]]):
                         previous_sides_all[sample_index],
                         file_path,
                     )
+                if frame_ids is not None:
+                    sample["frame_id"] = frame_ids[sample_index].to(dtype=torch.int64)
                 yield sample
 
 

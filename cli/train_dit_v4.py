@@ -19,7 +19,6 @@ import torch.distributed as dist
 import torch.nn.functional as functional
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
-from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from app.decoder_api_config import get_decoder_api_config
 from app.config import get_settings
@@ -133,6 +132,30 @@ def _unwrap_model(model: nn.Module) -> nn.Module:
     if isinstance(model, DistributedDataParallel):
         return model.module
     return model
+
+
+def _supports_first_frame_conditioning(model: nn.Module) -> bool:
+    return hasattr(_unwrap_model(model), "first_frame_embedding")
+
+
+def _is_first_frame_from_frame_ids(frame_ids: torch.Tensor | None) -> torch.Tensor | None:
+    if frame_ids is None:
+        return None
+    return frame_ids.reshape(-1) == 0
+
+
+def _maybe_add_first_frame_input(
+    *,
+    model: nn.Module,
+    model_inputs: dict[str, torch.Tensor],
+    frame_ids: torch.Tensor | None,
+) -> None:
+    if not _supports_first_frame_conditioning(model):
+        return
+    is_first_frame = _is_first_frame_from_frame_ids(frame_ids)
+    if is_first_frame is None:
+        raise ValueError("Для DiT v4 требуется frame_id, чтобы передать is_first_frame в AdaLN.")
+    model_inputs["is_first_frame"] = is_first_frame
 
 
 def _is_distributed_ready() -> bool:
@@ -311,11 +334,11 @@ def _compute_losses(
         temporal_target = (
             previous_sides.detach() if loss_config.temporal_detach_previous else previous_sides
         )
-        temporal_raw_loss = torch.sqrt(
+        temporal_loss_sample = torch.sqrt(
             (x0_prediction - temporal_target).pow(2) + float(loss_config.charbonnier_epsilon) ** 2
-        ).mean()
+        ).flatten(1).mean(dim=1)
         temporal_scale = loss_config.temporal_warmup_scale(global_step)
-        temporal_loss = temporal_raw_loss * temporal_scale
+        temporal_loss = temporal_loss_sample.mean() * temporal_scale
     else:
         temporal_loss = torch.zeros_like(diffusion_loss)
 
@@ -463,6 +486,8 @@ def evaluate_on_validation(
             previous_sides = (
                 batch["previous_sides"].to(device, non_blocking=use_cuda) if use_previous_sides else None
             )
+            frame_ids = batch.get("frame_id")
+            frame_ids = frame_ids.to(device, non_blocking=use_cuda) if frame_ids is not None else None
             timesteps = scheduler.sample_timesteps(batch_size=clean_target.shape[0], device=device)
             noise = torch.randn_like(clean_target)
             noisy_target = scheduler.add_noise(clean_target, noise, timesteps)
@@ -478,6 +503,11 @@ def evaluate_on_validation(
                 }
                 if previous_sides is not None:
                     model_inputs["previous_sides_latents"] = previous_sides
+                _maybe_add_first_frame_input(
+                    model=model,
+                    model_inputs=model_inputs,
+                    frame_ids=frame_ids,
+                )
                 model_output = model(**model_inputs)
                 batch_metrics = compute_noise_metrics(
                     model_output=model_output,
@@ -522,12 +552,15 @@ def _collect_fixed_preview_batch(
     fixed_condition: list[torch.Tensor] = []
     fixed_target: list[torch.Tensor] = []
     fixed_previous_sides: list[torch.Tensor] = []
+    fixed_frame_ids: list[torch.Tensor] = []
     has_previous_sides = False
+    has_frame_ids = False
     collected = 0
     for batch in dataloader:
         condition = batch["condition"]
         target = batch["target"]
         previous_sides = batch.get("previous_sides")
+        frame_ids = batch.get("frame_id")
         batch_size = condition.shape[0]
         take_count = min(max_images - collected, batch_size)
         if take_count <= 0:
@@ -537,6 +570,9 @@ def _collect_fixed_preview_batch(
         if previous_sides is not None:
             has_previous_sides = True
             fixed_previous_sides.append(previous_sides[:take_count].detach().cpu())
+        if frame_ids is not None:
+            has_frame_ids = True
+            fixed_frame_ids.append(frame_ids[:take_count].detach().cpu())
         collected += take_count
         if collected >= max_images:
             break
@@ -550,6 +586,8 @@ def _collect_fixed_preview_batch(
     }
     if has_previous_sides:
         preview_batch["previous_sides"] = torch.cat(fixed_previous_sides, dim=0)
+    if has_frame_ids:
+        preview_batch["frame_id"] = torch.cat(fixed_frame_ids, dim=0)
     return preview_batch
 
 
@@ -590,6 +628,7 @@ def _run_preview_sampling(
     preview_steps: list[int],
     prediction_type: str,
     previous_sides_latents: torch.Tensor | None = None,
+    is_first_frame: torch.Tensor | None = None,
 ) -> dict[int, torch.Tensor]:
     valid_steps = sorted(
         {step for step in preview_steps if 1 <= step <= scheduler.num_train_timesteps}
@@ -620,6 +659,8 @@ def _run_preview_sampling(
             if previous_sides_latents is not None:
                 previous_sides = previous_sides_latents.to(device, non_blocking=use_cuda)
                 model_inputs["previous_sides_latents"] = previous_sides
+            if is_first_frame is not None:
+                model_inputs["is_first_frame"] = is_first_frame.to(device, non_blocking=use_cuda)
             model_output = model(**model_inputs)
             predicted_noise = _prediction_to_eps(
                 model_output=model_output,
@@ -976,6 +1017,7 @@ def main() -> None:
         model_config = build_config_from_settings(settings, architecture_name=args.architecture)
         use_previous_sides = model_config.architecture_name in {"dit_v3", "dit_v4"}
         base_model = build_model(model_config).to(device)
+        use_first_frame_conditioning = _supports_first_frame_conditioning(base_model)
         ema = ExponentialMovingAverage(base_model, decay=settings.ema_decay) if settings.use_ema else None
         model: nn.Module
         if is_distributed:
@@ -1002,14 +1044,6 @@ def main() -> None:
             model.parameters(),
             lr=settings.learning_rate,
             weight_decay=settings.weight_decay,
-        )
-        cosine_eta_min = settings.learning_rate * 0.1
-        lr_total_steps = max_steps
-        lr_step_mode = "per_step"
-        lr_scheduler = CosineAnnealingLR(
-            optimizer=optimizer,
-            T_max=max(1, lr_total_steps),
-            eta_min=cosine_eta_min,
         )
         scheduler = LinearNoiseScheduler(
             num_train_timesteps=settings.num_train_timesteps,
@@ -1060,6 +1094,7 @@ def main() -> None:
             "input_normalization": bool(getattr(model_config, "input_normalization", False)),
             "update_condition_tokens": bool(getattr(model_config, "update_condition_tokens", False)),
             "backbone_type": getattr(model_config, "backbone_type", "n/a"),
+            "first_frame_conditioning": use_first_frame_conditioning,
             "use_autocast": autocast_enabled,
             "autocast_dtype": _torch_dtype_name(autocast_dtype),
             "ddp_enabled": is_distributed,
@@ -1097,10 +1132,10 @@ def main() -> None:
                     "model_params_total": total_params,
                     "model_params_trainable": trainable_params,
                     "train_val_split_ratio": "0.9/0.1",
-                    "lr_scheduler": "cosine_decay",
-                    "lr_scheduler_mode": lr_step_mode,
-                    "lr_scheduler_total_steps": lr_total_steps,
-                    "lr_scheduler_eta_min": cosine_eta_min,
+                    "lr_scheduler": "constant",
+                    "lr_scheduler_mode": "disabled",
+                    "lr_scheduler_total_steps": 0,
+                    "lr_scheduler_eta_min": settings.learning_rate,
                     "preview_every_n_epochs": preview_interval_epochs,
                     "preview_every_n_steps": preview_interval_steps,
                     "preview_images_count": preview_images_count,
@@ -1181,6 +1216,12 @@ def main() -> None:
                         if use_previous_sides
                         else None
                     )
+                    frame_ids = batch.get("frame_id")
+                    frame_ids = (
+                        frame_ids.to(device, non_blocking=use_cuda)
+                        if frame_ids is not None
+                        else None
+                    )
 
                     timesteps = scheduler.sample_timesteps(
                         batch_size=clean_target.shape[0], device=device
@@ -1200,6 +1241,11 @@ def main() -> None:
                         }
                         if previous_sides is not None:
                             model_inputs["previous_sides_latents"] = previous_sides
+                        _maybe_add_first_frame_input(
+                            model=model,
+                            model_inputs=model_inputs,
+                            frame_ids=frame_ids,
+                        )
                         model_output = model(**model_inputs)
                         (
                             loss,
@@ -1245,8 +1291,6 @@ def main() -> None:
                         optimizer.step()
                     if ema is not None:
                         ema.update(_unwrap_model(model))
-                    if lr_step_mode == "per_step":
-                        lr_scheduler.step()
 
                     global_step += 1
 
@@ -1373,6 +1417,11 @@ def main() -> None:
                             if preview_previous_sides is not None
                             else None
                         )
+                        preview_is_first_frame = (
+                            _is_first_frame_from_frame_ids(fixed_preview_batch.get("frame_id"))
+                            if _supports_first_frame_conditioning(preview_model)
+                            else None
+                        )
                         preview_snapshots = _run_preview_sampling(
                             model=preview_model,
                             scheduler=scheduler,
@@ -1383,6 +1432,7 @@ def main() -> None:
                             preview_steps=preview_steps,
                             prediction_type=prediction_type,
                             previous_sides_latents=preview_previous_sides,
+                            is_first_frame=preview_is_first_frame,
                         )
                         _log_preview_figure(
                             mlflow_repo=mlflow_repo,
@@ -1413,6 +1463,7 @@ def main() -> None:
                         batch,
                         condition,
                         clean_target,
+                        frame_ids,
                         timesteps,
                         noise,
                         noisy_target,
@@ -1492,6 +1543,8 @@ def main() -> None:
                         .numpy()
                         .astype(np.float32)
                     )
+                if use_first_frame_conditioning:
+                    dit_input_examples["is_first_frame"] = np.array([False], dtype=np.bool_)
                 registration = mlflow_repo.register_final_model(
                     model=export_model,
                     registered_model_name=args.registered_model_name,
