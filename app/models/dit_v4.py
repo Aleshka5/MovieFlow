@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from torch import Tensor
 
+from app.models.dit_v2 import _modulate
 from app.models.dit_v3 import DiTV3Model, DiTV3ModelConfig
 
 
@@ -74,6 +75,9 @@ class DiTV4Model(DiTV3Model):
                 masked[..., column_index] = 0
         return masked
 
+    def _adaln_states(self, timestep_states: Tensor, condition_states: Tensor) -> Tensor:
+        return timestep_states + condition_states.mean(dim=1)
+
     def forward(
         self,
         noisy_query_latents: Tensor,
@@ -81,9 +85,80 @@ class DiTV4Model(DiTV3Model):
         previous_sides_latents: Tensor,
         timesteps: Tensor,
     ) -> Tensor:
-        return super().forward(
-            noisy_query_latents=noisy_query_latents,
-            condition_latents=condition_latents,
-            previous_sides_latents=self.mask_sides_latents(previous_sides_latents),
+        self._validate_channels_first(
+            noisy_query_latents,
+            source="noisy_query_latents",
+            expected_height=self.config.query_height,
+            expected_width=self.config.query_width,
+        )
+        self._validate_channels_first(
+            condition_latents,
+            source="condition_latents",
+            expected_height=self.config.condition_height,
+            expected_width=self.config.condition_width,
+        )
+        previous_sides_latents = self.mask_sides_latents(previous_sides_latents)
+
+        query_patches = self._patchify(
+            noisy_query_latents,
+            patch_embedding=self.query_patch_embedding,
+            patch_size=self.config.query_patch_size,
+            source="noisy_query_latents",
+        )
+        condition_patches = self._patchify(
+            condition_latents,
+            patch_embedding=self.condition_patch_embedding,
+            patch_size=self.config.condition_patch_size,
+            source="condition_latents",
+        )
+        previous_patches = self._patchify(
+            previous_sides_latents,
+            patch_embedding=self.previous_patch_embedding,
+            patch_size=self.config.previous_patch_size,
+            source="previous_sides_latents",
+        )
+
+        query_states = self._tokens_from_patches(query_patches)
+        condition_states = self._tokens_from_patches(condition_patches)
+        previous_states = self._tokens_from_patches(previous_patches)
+
+        query_positional = self.query_positional_embedding.to(dtype=query_states.dtype)
+        condition_positional = self.condition_positional_embedding.to(dtype=condition_states.dtype)
+        previous_positional = self.previous_positional_embedding.to(dtype=previous_states.dtype)
+        query_states = query_states + query_positional
+        condition_states = condition_states + condition_positional
+        previous_states = previous_states + previous_positional
+
+        if timesteps.ndim == 0:
+            timesteps = timesteps.unsqueeze(0)
+        if timesteps.shape[0] == 1 and query_states.shape[0] > 1:
+            timesteps = timesteps.expand(query_states.shape[0])
+        if timesteps.shape[0] != query_states.shape[0]:
+            raise ValueError(
+                "Размер timesteps должен совпадать с batch size: "
+                f"timesteps={timesteps.shape[0]}, batch={query_states.shape[0]}."
+            )
+
+        timestep_states = self._sinusoidal_timestep_embedding(
             timesteps=timesteps,
+            embedding_dim=self.config.hidden_size,
+        ).to(dtype=query_states.dtype)
+        timestep_states = self.timestep_mlp(timestep_states)
+        adaln_states = self._adaln_states(timestep_states, condition_states)
+
+        for block_index, block in enumerate(self.blocks):
+            query_states = block(
+                query_states,
+                condition_states,
+                previous_states,
+                adaln_states,
+                use_previous_cross=block_index >= self.previous_cross_start_block,
+            )
+
+        shift, scale = self.final_modulation(adaln_states).chunk(2, dim=1)
+        query_states = _modulate(self.final_norm(query_states), shift, scale)
+        return self._unpatchify(
+            query_states,
+            output_height=self.config.query_height,
+            output_width=self.config.query_width,
         )

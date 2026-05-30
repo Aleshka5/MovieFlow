@@ -758,6 +758,91 @@ def _log_preview_figure_decoded(
     plt.close(figure)
 
 
+def _positional_component_indices(hidden_size: int) -> list[tuple[int, str]]:
+    half = hidden_size // 2
+    quarter = max(half // 2, 1)
+    candidates = (
+        (0, "y sin"),
+        (quarter, "y cos"),
+        (half, "x sin"),
+        (half + quarter, "x cos"),
+    )
+    seen: set[int] = set()
+    result: list[tuple[int, str]] = []
+    for index, title in candidates:
+        if 0 <= index < hidden_size and index not in seen:
+            result.append((index, title))
+            seen.add(index)
+    return result
+
+
+def _log_positional_encoding_preview(
+    *,
+    mlflow_repo: MLflowRepository,
+    model: nn.Module,
+    global_step: int,
+) -> None:
+    base_model = _unwrap_model(model)
+    embedding_specs = (
+        (
+            "query",
+            getattr(base_model, "query_positional_embedding", None),
+            getattr(base_model, "query_patches_h", None),
+            getattr(base_model, "query_patches_w", None),
+        ),
+        (
+            "condition",
+            getattr(base_model, "condition_positional_embedding", None),
+            getattr(base_model, "condition_patches_h", None),
+            getattr(base_model, "condition_patches_w", None),
+        ),
+        (
+            "previous",
+            getattr(base_model, "previous_positional_embedding", None),
+            getattr(base_model, "previous_patches_h", None),
+            getattr(base_model, "previous_patches_w", None),
+        ),
+    )
+    rows: list[tuple[str, torch.Tensor, int, int]] = []
+    for name, embedding, patches_h, patches_w in embedding_specs:
+        if embedding is None or patches_h is None or patches_w is None:
+            continue
+        if embedding.ndim != 3 or embedding.shape[0] != 1:
+            continue
+        if embedding.shape[1] != int(patches_h) * int(patches_w):
+            continue
+        rows.append((name, embedding.detach().float().cpu()[0], int(patches_h), int(patches_w)))
+
+    if not rows:
+        return
+
+    component_indices = _positional_component_indices(rows[0][1].shape[1])
+    if not component_indices:
+        return
+
+    figure, axes = plt.subplots(
+        len(rows),
+        len(component_indices),
+        figsize=(3.0 * len(component_indices), 2.8 * len(rows)),
+        squeeze=False,
+    )
+    for row_index, (name, embedding, patches_h, patches_w) in enumerate(rows):
+        for col_index, (component_index, component_title) in enumerate(component_indices):
+            grid = embedding[:, component_index].view(patches_h, patches_w).numpy()
+            axes[row_index][col_index].imshow(grid, cmap="coolwarm", interpolation="nearest")
+            axes[row_index][col_index].set_axis_off()
+            axes[row_index][col_index].set_title(
+                f"{name}: {component_title} d{component_index}",
+                fontsize=9,
+            )
+    figure.tight_layout()
+    mlflow_repo.mlflow.log_figure(
+        figure,
+        artifact_file=f"preview/positional_encoding_global_step_{global_step:08d}.png",
+    )
+    plt.close(figure)
+
+
 def main() -> None:
     args = parse_args()
     is_distributed, rank, local_rank, world_size = _init_distributed(args)
@@ -1074,6 +1159,12 @@ def main() -> None:
                 )
             else:
                 fixed_preview_noise = None
+            if mlflow_repo is not None and preview_interval_steps > 0:
+                _log_positional_encoding_preview(
+                    mlflow_repo=mlflow_repo,
+                    model=_unwrap_model(model),
+                    global_step=global_step,
+                )
 
             last_val_metrics: dict[str, float] = {}
             train_iterator = iter(train_dataloader)
