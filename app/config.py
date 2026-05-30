@@ -4,8 +4,10 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from app.loss_config import LossConfig
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -62,16 +64,16 @@ class Settings(BaseSettings):
     target_key: str = Field(default="source_image_sides", alias="TARGET_KEY")
     previous_sides_key: str = Field(default="previous_frame_sides", alias="PREVIOUS_SIDES_KEY")
     condition_height: int = Field(default=30, alias="CONDITION_HEIGHT")
-    condition_width: int = Field(default=54, alias="CONDITION_WIDTH")
+    condition_width: int = Field(default=27, alias="CONDITION_WIDTH")
     query_height: int = Field(default=30, alias="QUERY_HEIGHT")
-    query_width: int = Field(default=16, alias="QUERY_WIDTH")
+    query_width: int = Field(default=8, alias="QUERY_WIDTH")
     hidden_size: int = Field(default=256, alias="HIDDEN_SIZE")
     num_attention_heads: int = Field(default=8, alias="NUM_ATTENTION_HEADS")
     num_transformer_blocks: int = Field(default=16, alias="NUM_TRANSFORMER_BLOCKS")
     mlp_ratio: float = Field(default=4.0, alias="MLP_RATIO")
     dropout: float = Field(default=0.05, alias="DROPOUT")
     dit_v2_query_patch_size: int = Field(default=2, alias="DIT_V2_QUERY_PATCH_SIZE")
-    dit_v2_condition_patch_size: int = Field(default=2, alias="DIT_V2_CONDITION_PATCH_SIZE")
+    dit_v2_condition_patch_size: int = Field(default=3, alias="DIT_V2_CONDITION_PATCH_SIZE")
     dit_v3_previous_patch_size: int = Field(default=2, alias="DIT_V3_PREVIOUS_PATCH_SIZE")
     dit_v3_previous_cross_start_block: int = Field(
         default=-1, alias="DIT_V3_PREVIOUS_CROSS_START_BLOCK"
@@ -97,7 +99,19 @@ class Settings(BaseSettings):
     prediction_type: str = Field(default="epsilon_v_hybrid", alias="PREDICTION_TYPE")
     epsilon_v_hybrid_lambda: float = Field(default=0.5, alias="EPSILON_V_HYBRID_LAMBDA")
     min_snr_gamma: float = Field(default=5.0, alias="MIN_SNR_GAMMA")
-    detail_loss_weight: float = Field(default=0.05, alias="DETAIL_LOSS_WEIGHT")
+    loss_weight_diffusion: float = Field(default=1.0, alias="LOSS_WEIGHT_DIFFUSION")
+    loss_weight_detail: float = Field(
+        default=0.05,
+        validation_alias=AliasChoices("LOSS_WEIGHT_DETAIL", "DETAIL_LOSS_WEIGHT"),
+    )
+    loss_weight_charbonnier: float = Field(default=0.0, alias="LOSS_WEIGHT_CHARBONNIER")
+    loss_weight_fft: float = Field(default=0.0, alias="LOSS_WEIGHT_FFT")
+    loss_weight_temporal: float = Field(default=0.0, alias="LOSS_WEIGHT_TEMPORAL")
+    loss_charbonnier_epsilon: float = Field(default=1e-3, alias="LOSS_CHARBONNIER_EPSILON")
+    loss_fft_epsilon: float = Field(default=1e-6, alias="LOSS_FFT_EPSILON")
+    loss_fft_use_log_magnitude: bool = Field(default=True, alias="LOSS_FFT_USE_LOG_MAGNITUDE")
+    loss_temporal_warmup_steps: int = Field(default=0, alias="LOSS_TEMPORAL_WARMUP_STEPS")
+    loss_temporal_detach_previous: bool = Field(default=True, alias="LOSS_TEMPORAL_DETACH_PREVIOUS")
     use_ema: bool = Field(default=True, alias="USE_EMA")
     ema_decay: float = Field(default=0.999, alias="EMA_DECAY")
 
@@ -115,8 +129,17 @@ class Settings(BaseSettings):
             run_id.strip() for run_id in self.mlflow_dataset_run_ids.split(",") if run_id.strip()
         ]
 
+    @property
+    def loss_config(self) -> LossConfig:
+        return LossConfig.from_settings(self)
+
+    @property
+    def detail_loss_weight(self) -> float:
+        # Backward-compatible alias for older training scripts.
+        return float(self.loss_weight_detail)
+
     def mlflow_param_dict(self) -> dict[str, Any]:
-        return {
+        params = {
             "latent_channels": self.latent_channels,
             "architecture_name": self.model_architecture,
             "condition_key": self.condition_key,
@@ -160,6 +183,8 @@ class Settings(BaseSettings):
             "beta_end": self.beta_end,
             "mlflow_registered_model_name": self.mlflow_registered_model_name,
         }
+        params.update(self.loss_config.mlflow_param_dict())
+        return params
 
 
 @lru_cache(maxsize=1)

@@ -23,6 +23,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from app.decoder_api_config import get_decoder_api_config
 from app.config import get_settings
+from app.loss_config import LossConfig
 from app.models.model_archive import build_config_from_settings, build_model, list_architectures
 from app.src.data.sft_dataset import create_sft_dataloader
 from app.src.repositories.mlflow import MLflowRepository
@@ -231,8 +232,10 @@ def _compute_losses(
     prediction_type: str,
     epsilon_v_hybrid_lambda: float,
     min_snr_gamma: float,
-    detail_loss_weight: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    loss_config: LossConfig,
+    global_step: int,
+    previous_sides: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     sqrt_alpha, sqrt_one_minus_alpha = _extract_schedule_coefficients(scheduler, timesteps)
     eps_prediction = _prediction_to_eps(
         model_output=model_output,
@@ -282,8 +285,47 @@ def _compute_losses(
         grad_y_pred, grad_y_true
     )
 
-    total_loss = diffusion_loss + float(detail_loss_weight) * detail_loss
-    return total_loss, diffusion_loss, detail_loss, eps_prediction
+    charbonnier_loss = torch.sqrt(
+        (x0_prediction - clean_target).pow(2) + float(loss_config.charbonnier_epsilon) ** 2
+    ).mean()
+
+    predicted_fft = torch.fft.rfft2(x0_prediction.float(), dim=(-2, -1))
+    target_fft = torch.fft.rfft2(clean_target.float(), dim=(-2, -1))
+    predicted_magnitude = predicted_fft.abs()
+    target_magnitude = target_fft.abs()
+    if loss_config.fft_use_log_magnitude:
+        predicted_magnitude = torch.log(predicted_magnitude + float(loss_config.fft_epsilon))
+        target_magnitude = torch.log(target_magnitude + float(loss_config.fft_epsilon))
+    fft_loss = functional.l1_loss(predicted_magnitude, target_magnitude)
+
+    if previous_sides is not None:
+        temporal_target = (
+            previous_sides.detach() if loss_config.temporal_detach_previous else previous_sides
+        )
+        temporal_raw_loss = torch.sqrt(
+            (x0_prediction - temporal_target).pow(2) + float(loss_config.charbonnier_epsilon) ** 2
+        ).mean()
+        temporal_scale = loss_config.temporal_warmup_scale(global_step)
+        temporal_loss = temporal_raw_loss * temporal_scale
+    else:
+        temporal_loss = torch.zeros_like(diffusion_loss)
+
+    total_loss = (
+        float(loss_config.weight_diffusion) * diffusion_loss
+        + float(loss_config.weight_detail) * detail_loss
+        + float(loss_config.weight_charbonnier) * charbonnier_loss
+        + float(loss_config.weight_fft) * fft_loss
+        + float(loss_config.weight_temporal) * temporal_loss
+    )
+    return (
+        total_loss,
+        diffusion_loss,
+        detail_loss,
+        charbonnier_loss,
+        fft_loss,
+        temporal_loss,
+        eps_prediction,
+    )
 
 
 def compute_noise_metrics(
@@ -297,9 +339,19 @@ def compute_noise_metrics(
     prediction_type: str,
     epsilon_v_hybrid_lambda: float,
     min_snr_gamma: float,
-    detail_loss_weight: float,
+    loss_config: LossConfig,
+    global_step: int,
+    previous_sides: torch.Tensor | None,
 ) -> dict[str, float]:
-    total_loss, diffusion_loss, detail_loss, eps_prediction = _compute_losses(
+    (
+        total_loss,
+        diffusion_loss,
+        detail_loss,
+        charbonnier_loss,
+        fft_loss,
+        temporal_loss,
+        eps_prediction,
+    ) = _compute_losses(
         model_output=model_output,
         noise=noise,
         clean_target=clean_target,
@@ -309,11 +361,16 @@ def compute_noise_metrics(
         prediction_type=prediction_type,
         epsilon_v_hybrid_lambda=epsilon_v_hybrid_lambda,
         min_snr_gamma=min_snr_gamma,
-        detail_loss_weight=detail_loss_weight,
+        loss_config=loss_config,
+        global_step=global_step,
+        previous_sides=previous_sides,
     )
     loss_mse = float(diffusion_loss.item())
     loss_total = float(total_loss.item())
     loss_detail = float(detail_loss.item())
+    loss_charbonnier = float(charbonnier_loss.item())
+    loss_fft = float(fft_loss.item())
+    loss_temporal = float(temporal_loss.item())
     loss_l1 = float(functional.l1_loss(eps_prediction, noise).item())
     cosine_similarity = float(
         functional.cosine_similarity(
@@ -336,6 +393,9 @@ def compute_noise_metrics(
         "loss_total": loss_total,
         "loss_mse": loss_mse,
         "loss_detail": loss_detail,
+        "loss_charbonnier": loss_charbonnier,
+        "loss_fft": loss_fft,
+        "loss_temporal": loss_temporal,
         "loss_l1": loss_l1,
         "noise_cosine_similarity": cosine_similarity,
         "x0_reconstruction_mse": x0_reconstruction_mse,
@@ -377,7 +437,8 @@ def evaluate_on_validation(
     prediction_type: str,
     epsilon_v_hybrid_lambda: float,
     min_snr_gamma: float,
-    detail_loss_weight: float,
+    loss_config: LossConfig,
+    global_step: int,
     use_previous_sides: bool,
 ) -> dict[str, float]:
     model.eval()
@@ -419,7 +480,9 @@ def evaluate_on_validation(
                     prediction_type=prediction_type,
                     epsilon_v_hybrid_lambda=epsilon_v_hybrid_lambda,
                     min_snr_gamma=min_snr_gamma,
-                    detail_loss_weight=detail_loss_weight,
+                    loss_config=loss_config,
+                    global_step=global_step,
+                    previous_sides=previous_sides,
                 )
             batch_size = clean_target.shape[0]
             samples_seen += batch_size
@@ -865,6 +928,7 @@ def main() -> None:
                     decoder_client = None
 
         global_step = 0
+        loss_config = settings.loss_config
         preview_interval_epochs = max(args.preview_every_n_epochs, 0)
         preview_images_count = max(args.preview_images_count, 0)
         preview_steps = [1000]
@@ -923,10 +987,10 @@ def main() -> None:
                     "prediction_type": prediction_type,
                     "epsilon_v_hybrid_lambda": epsilon_v_hybrid_lambda,
                     "min_snr_gamma": settings.min_snr_gamma,
-                    "detail_loss_weight": settings.detail_loss_weight,
                     "use_ema": settings.use_ema,
                     "ema_decay": settings.ema_decay,
                     "val_every_n_logs": val_every_n_logs,
+                    **loss_config.mlflow_param_dict(),
                     **model_runtime_params,
                 }
             )
@@ -946,7 +1010,6 @@ def main() -> None:
                         "prediction_type": prediction_type,
                         "epsilon_v_hybrid_lambda": epsilon_v_hybrid_lambda,
                         "min_snr_gamma": settings.min_snr_gamma,
-                        "detail_loss_weight": settings.detail_loss_weight,
                         "use_ema": settings.use_ema,
                         "ema_decay": settings.ema_decay,
                         "val_every_n_logs": val_every_n_logs,
@@ -1012,7 +1075,15 @@ def main() -> None:
                         if previous_sides is not None:
                             model_inputs["previous_sides_latents"] = previous_sides
                         model_output = model(**model_inputs)
-                        loss, diffusion_loss, detail_loss, _ = _compute_losses(
+                        (
+                            loss,
+                            diffusion_loss,
+                            detail_loss,
+                            charbonnier_loss,
+                            fft_loss,
+                            temporal_loss,
+                            _,
+                        ) = _compute_losses(
                             model_output=model_output,
                             noise=noise,
                             clean_target=clean_target,
@@ -1022,7 +1093,9 @@ def main() -> None:
                             prediction_type=prediction_type,
                             epsilon_v_hybrid_lambda=epsilon_v_hybrid_lambda,
                             min_snr_gamma=settings.min_snr_gamma,
-                            detail_loss_weight=settings.detail_loss_weight,
+                            loss_config=loss_config,
+                            global_step=global_step,
+                            previous_sides=previous_sides,
                         )
 
                     optimizer.zero_grad(set_to_none=True)
@@ -1064,11 +1137,16 @@ def main() -> None:
                                 prediction_type=prediction_type,
                                 epsilon_v_hybrid_lambda=epsilon_v_hybrid_lambda,
                                 min_snr_gamma=settings.min_snr_gamma,
-                                detail_loss_weight=settings.detail_loss_weight,
+                                loss_config=loss_config,
+                                global_step=global_step,
+                                previous_sides=previous_sides,
                             )
                             train_metrics["loss_total_backprop"] = float(loss.item())
                             train_metrics["loss_mse_backprop"] = float(diffusion_loss.item())
                             train_metrics["loss_detail_backprop"] = float(detail_loss.item())
+                            train_metrics["loss_charbonnier_backprop"] = float(charbonnier_loss.item())
+                            train_metrics["loss_fft_backprop"] = float(fft_loss.item())
+                            train_metrics["loss_temporal_backprop"] = float(temporal_loss.item())
 
                         step_duration = max(time.perf_counter() - step_start_time, 1e-8)
                         train_metrics.update(
@@ -1109,7 +1187,8 @@ def main() -> None:
                                 prediction_type=prediction_type,
                                 epsilon_v_hybrid_lambda=epsilon_v_hybrid_lambda,
                                 min_snr_gamma=settings.min_snr_gamma,
-                                detail_loss_weight=settings.detail_loss_weight,
+                                loss_config=loss_config,
+                                global_step=global_step,
                                 use_previous_sides=use_previous_sides,
                             )
                             last_val_metrics = val_metrics
@@ -1168,6 +1247,9 @@ def main() -> None:
                         grad_norm,
                         diffusion_loss,
                         detail_loss,
+                        charbonnier_loss,
+                        fft_loss,
+                        temporal_loss,
                     )
 
                 if max_steps == 0 and is_main_process:
@@ -1191,7 +1273,8 @@ def main() -> None:
                         prediction_type=prediction_type,
                         epsilon_v_hybrid_lambda=epsilon_v_hybrid_lambda,
                         min_snr_gamma=settings.min_snr_gamma,
-                        detail_loss_weight=settings.detail_loss_weight,
+                        loss_config=loss_config,
+                        global_step=global_step,
                         use_previous_sides=use_previous_sides,
                     )
                     last_val_metrics = epoch_val_metrics
