@@ -1080,9 +1080,6 @@ def main() -> None:
             while global_step < max_steps:
                 try:
                     batch = next(train_iterator)
-                except StopIteration:
-                    train_iterator = iter(train_dataloader)
-                    continue
 
                     step_start_time = time.perf_counter()
                     model.train()
@@ -1337,6 +1334,9 @@ def main() -> None:
                         fft_loss,
                         temporal_loss,
                     )
+                except StopIteration:
+                    train_iterator = iter(train_dataloader)
+                    continue
 
             if val_every_n_logs == 0 and is_main_process:
                 eval_model = ema.model if ema is not None else _unwrap_model(model)

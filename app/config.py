@@ -88,7 +88,7 @@ class Settings(BaseSettings):
     train_batch_size: int = Field(default=8, alias="TRAIN_BATCH_SIZE")
     train_num_workers: int = Field(default=0, alias="TRAIN_NUM_WORKERS")
     train_max_steps: int = Field(default=10000, alias="TRAIN_MAX_STEPS")
-    val_every_n_logs: int = Field(default=0, alias="VAL_EVERY_N_LOGS")
+    val_every_n_logs: int = Field(default=100, alias="VAL_EVERY_N_LOGS")
     preview_every_n_steps: int = Field(default=2000, alias="PREVIEW_EVERY_N_STEPS")
     preview_images_count: int = Field(default=4, alias="PREVIEW_IMAGES_COUNT")
     learning_rate: float = Field(default=1e-4, alias="LEARNING_RATE")
